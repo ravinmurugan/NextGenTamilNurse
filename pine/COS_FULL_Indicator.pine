@@ -1,0 +1,318 @@
+// ════════════════════════════════════════════════════════════════════════════
+// COS-FULL ⚡ INDICATOR — CME Opening Surge + PM Directional Scalp
+// Discretionary / manual-entry STUDY version of COS_FULL.pine (strategy)
+//
+//   • Same core triggers as COS_FULL: Volume Surge + Session VWAP + bar direction
+//   • Same Telegram webhook JSON  ( "strategy":"COS" )  → fully compatible with
+//     cos_webhook_handler.py  ( POST  :8002/cos-signal ).  Payload is ENRICHED
+//     with surge / vwap / confluence_score so the Telegram message is complete.
+//   • PROFIT BOOSTERS (new): HTF EMA trend filter, RSI exhaustion guard,
+//     cumulative-delta alignment, 0–100 Confluence Score, optional ATR-adaptive
+//     TP/SL, and an optional "minimum score" gate.
+//   • Lightweight position simulation → clean signal spacing, live FLAT / IN-TRADE
+//     state, and a running today W/L tally — no strategy tester needed.
+//
+// IMPORTANT: Booster filters are LOGIC-based edge improvements, NOT re-backtested.
+//   Defaults keep the original signal set almost intact (only EMA-trend ON).
+//   Set "EMA trend filter" = false to reproduce the exact original COS-FULL set.
+//   A/B test (score-only first, then gate) before flipping anything to live.
+//@version=6
+indicator("COS-FULL ⚡ Indicator (Surge + PM Scalp)", overlay=true, max_lines_count=200, max_labels_count=200)
+
+// ── Module 1 — COS-PRO (morning surge) ───────────────────────────────────────
+i_m1_surge  = input.float(3.5,  "M1 Surge Multiplier", minval=2.0, step=0.5, group="Module 1 - COS-PRO")
+i_m1_lb     = input.int  (20,   "M1 Volume Lookback",  minval=5, maxval=50,  group="Module 1 - COS-PRO")
+i_m1_tp     = input.float(12.0, "M1 Take Profit pts",  minval=4.0, step=1.0, group="Module 1 - COS-PRO")
+i_m1_sl     = input.float(6.0,  "M1 Stop Loss pts",    minval=2.0, step=1.0, group="Module 1 - COS-PRO")
+i_m1_max_c  = input.int  (3,    "M1 Max Contracts",    minval=1, maxval=5,   group="Module 1 - COS-PRO")
+i_m1_base_c = input.int  (1,    "M1 Base Contracts",   minval=1, maxval=3,   group="Module 1 - COS-PRO")
+i_m1_on     = input.bool (true, "Enable M1 COS-PRO",                         group="Module 1 - COS-PRO")
+
+// ── Module 2 — PM Scalp ──────────────────────────────────────────────────────
+i_m2_surge  = input.float(3.0,  "M2 Surge Multiplier", minval=2.0, step=0.5, group="Module 2 - PM Scalp")
+i_m2_lb     = input.int  (20,   "M2 Volume Lookback",  minval=5, maxval=50,  group="Module 2 - PM Scalp")
+i_m2_tp     = input.float(8.0,  "M2 Take Profit pts",  minval=2.0, step=1.0, group="Module 2 - PM Scalp")
+i_m2_sl     = input.float(4.0,  "M2 Stop Loss pts",    minval=1.0, step=0.5, group="Module 2 - PM Scalp")
+i_m2_max    = input.int  (3,    "M2 Max Trades/Day",   minval=1, maxval=6,   group="Module 2 - PM Scalp")
+i_m2_on     = input.bool (true, "Enable M2 PM Scalp",                        group="Module 2 - PM Scalp")
+
+// ── Profit Boosters (NEW) ────────────────────────────────────────────────────
+i_use_ema   = input.bool (true,  "EMA trend filter (block counter-trend)",      group="Profit Boosters")
+i_ema_len   = input.int  (200,   "EMA length",          minval=20, maxval=400,  group="Profit Boosters")
+i_use_rsi   = input.bool (false, "RSI exhaustion guard (block chasing extremes)",group="Profit Boosters")
+i_rsi_len   = input.int  (14,    "RSI length",          minval=5, maxval=30,    group="Profit Boosters")
+i_rsi_ob    = input.float(80.0,  "RSI overbought (block long)",  step=1.0,      group="Profit Boosters")
+i_rsi_os    = input.float(20.0,  "RSI oversold (block short)",   step=1.0,      group="Profit Boosters")
+i_use_delta = input.bool (false, "Require cumulative-delta alignment",          group="Profit Boosters")
+i_use_adapt = input.bool (false, "ATR-adaptive TP/SL (override fixed pts)",      group="Profit Boosters")
+i_atr_tp    = input.float(2.5,   "Adaptive TP = ATR ×",  minval=0.5, step=0.5,  group="Profit Boosters")
+i_atr_sl    = input.float(1.2,   "Adaptive SL = ATR ×",  minval=0.5, step=0.1,  group="Profit Boosters")
+i_min_conf  = input.int  (0,     "Min confluence score to alert (0 = off)", minval=0, maxval=100, group="Profit Boosters")
+
+// ── Options ──────────────────────────────────────────────────────────────────
+i_relax     = input.bool (false, "Relax Filters (backtest view — keep OFF for live)", group="Options")
+i_show_lines= input.bool (true,  "Show TP/SL lines on signals",                       group="Options")
+
+// ── Explicit ET timezone ─────────────────────────────────────────────────────
+TZ          = "America/New_York"
+et_hour     = hour(time, TZ)
+et_minute   = minute(time, TZ)
+is_new_day  = ta.change(time("D", TZ)) != 0
+is_rth_open = et_hour == 9  and et_minute == 30
+at_10am     = et_hour == 10 and et_minute == 0
+
+// ── Session VWAP (resets 9:30 ET) ────────────────────────────────────────────
+var float cum_tpv   = 0.0
+var float cum_vol   = 0.0
+var float sess_vwap = na
+if is_new_day or is_rth_open
+    cum_tpv := 0.0
+    cum_vol := 0.0
+typical    = (high + low + close) / 3.0
+cum_tpv   += typical * volume
+cum_vol   += volume
+sess_vwap := cum_vol > 0 ? cum_tpv / cum_vol : close
+
+// ── Cumulative Delta (resets 9:30 ET) ────────────────────────────────────────
+var float cum_delta = 0.0
+if is_new_day or is_rth_open
+    cum_delta := 0.0
+bar_range  = high - low
+buy_vol    = bar_range > 0 ? volume * (close - low)  / bar_range : volume * 0.5
+sell_vol   = bar_range > 0 ? volume * (high - close) / bar_range : volume * 0.5
+cum_delta += buy_vol - sell_vol
+
+// ── ATR Regime ───────────────────────────────────────────────────────────────
+daily_atr   = ta.atr(1)
+avg_atr     = ta.sma(daily_atr, 20)
+atr_ratio   = avg_atr > 0 ? daily_atr / avg_atr : 1.0
+regime_high = i_relax ? false : atr_ratio > 1.3
+regime_low  = atr_ratio < 0.7
+
+// ── Day of week / serial correlation ─────────────────────────────────────────
+dow        = dayofweek(time, TZ)
+is_tuesday = i_relax ? false : dow == dayofweek.tuesday
+is_mwt     = dow == dayofweek.monday or dow == dayofweek.wednesday or dow == dayofweek.thursday
+var int consec_dir = 0
+var int last_dir   = 0
+daily_dir = close > open ? 1 : -1
+if is_new_day
+    consec_dir := daily_dir == last_dir ? consec_dir + 1 : 1
+    last_dir   := daily_dir
+sweet_spot = consec_dir >= 1 and consec_dir <= 2
+exhausted  = i_relax ? false : consec_dir >= 3
+
+// ── Trade windows ────────────────────────────────────────────────────────────
+m1_window = not na(time(timeframe.period, "0930-1100", TZ))
+m2_window = not na(time(timeframe.period, "1100-1400", TZ))
+
+// ── M2 delta bias (captured at 10:00 ET) ─────────────────────────────────────
+var float delta_at_10am = 0.0
+var bool  bias_captured = false
+if is_new_day
+    bias_captured := false
+if at_10am and not bias_captured
+    delta_at_10am := cum_delta
+    bias_captured := true
+m2_bias = delta_at_10am >= 0 ? 1 : -1
+
+// ── Daily counters ───────────────────────────────────────────────────────────
+var int m1_trades = 0
+var int m2_trades = 0
+if is_new_day
+    m1_trades := 0
+    m2_trades := 0
+
+// ── Volume surge ─────────────────────────────────────────────────────────────
+vol_avg_m1 = ta.sma(volume, i_m1_lb)
+vol_avg_m2 = ta.sma(volume, i_m2_lb)
+surge_m1   = vol_avg_m1 > 0 ? volume / vol_avg_m1 : 0.0
+surge_m2   = vol_avg_m2 > 0 ? volume / vol_avg_m2 : 0.0
+bull_bar   = close > open
+bear_bar   = close < open
+
+// ── Booster indicators ───────────────────────────────────────────────────────
+ema_val = ta.ema(close, i_ema_len)
+rsi_val = ta.rsi(close, i_rsi_len)
+atr14   = ta.atr(14)
+trend_up   = close > ema_val
+trend_dn   = close < ema_val
+regime_ok  = not regime_high and not regime_low      // NORMAL = best regime
+
+// M1 dynamic sizing (unchanged from COS-FULL)
+boost_a = is_mwt and not regime_high
+boost_b = sweet_spot
+m1_qty  = math.min(i_m1_base_c + (boost_a ? 1 : 0) + (boost_b ? 1 : 0), i_m1_max_c)
+
+// ── Confluence score (0-100) ─────────────────────────────────────────────────
+// dir: 1 = long, -1 = short ; srg/thr = surge value & its threshold for the module
+f_score(int dir, float srg, float thr) =>
+    s = 0
+    s += (dir == 1 ? trend_up : trend_dn)                ? 20 : 0   // trend alignment
+    s += (dir == 1 ? rsi_val < i_rsi_ob : rsi_val > i_rsi_os) ? 15 : 0   // not exhausted
+    s += (dir == 1 ? cum_delta > 0 : cum_delta < 0)      ? 15 : 0   // order-flow agrees
+    s += regime_ok                                       ? 15 : 0   // normal volatility
+    s += (is_mwt and not is_tuesday)                     ? 10 : 0   // favourable weekday
+    s += (sweet_spot and not exhausted)                  ? 10 : 0   // serial sweet spot
+    s += (srg >= thr * 1.3)                              ? 15 : 0   // strong surge
+    s
+
+score_m1l = f_score(1,  surge_m1, i_m1_surge)
+score_m1s = f_score(-1, surge_m1, i_m1_surge)
+score_m2l = f_score(1,  surge_m2, i_m2_surge)
+score_m2s = f_score(-1, surge_m2, i_m2_surge)
+
+// ── Booster hard-filters ─────────────────────────────────────────────────────
+pass_long  = (not i_use_ema or trend_up) and (not i_use_rsi or rsi_val < i_rsi_ob) and (not i_use_delta or cum_delta > 0)
+pass_short = (not i_use_ema or trend_dn) and (not i_use_rsi or rsi_val > i_rsi_os) and (not i_use_delta or cum_delta < 0)
+
+// ── Adaptive vs fixed TP/SL ──────────────────────────────────────────────────
+m1_tp_pts = i_use_adapt ? math.max(atr14 * i_atr_tp, 1.0) : i_m1_tp
+m1_sl_pts = i_use_adapt ? math.max(atr14 * i_atr_sl, 1.0) : i_m1_sl
+m2_tp_pts = i_use_adapt ? math.max(atr14 * i_atr_tp, 1.0) : i_m2_tp
+m2_sl_pts = i_use_adapt ? math.max(atr14 * i_atr_sl, 1.0) : i_m2_sl
+
+// ── Position simulation (manage open trade BEFORE evaluating new signals) ─────
+var float pos_entry = na
+var int   pos_dir   = 0
+var float pos_tp    = na
+var float pos_sl    = na
+var int   wins      = 0
+var int   losses    = 0
+if is_new_day
+    wins   := 0
+    losses := 0
+if not na(pos_entry)
+    if pos_dir == 1
+        if high >= pos_tp
+            wins      += 1
+            pos_entry := na
+        else if low <= pos_sl
+            losses    += 1
+            pos_entry := na
+    else
+        if low <= pos_tp
+            wins      += 1
+            pos_entry := na
+        else if high >= pos_sl
+            losses    += 1
+            pos_entry := na
+flat = na(pos_entry)
+
+// ── Gates ────────────────────────────────────────────────────────────────────
+m1_ok    = i_m1_on and m1_window and not is_tuesday and not regime_high and not exhausted and m1_trades < 2 and flat
+m1_long  = m1_ok and surge_m1 >= i_m1_surge and close > sess_vwap and bull_bar and pass_long  and score_m1l >= i_min_conf
+m1_short = m1_ok and surge_m1 >= i_m1_surge and close < sess_vwap and bear_bar and pass_short and score_m1s >= i_min_conf
+
+m2_ok    = i_m2_on and m2_window and m2_trades < i_m2_max and flat and (bias_captured or i_relax)
+m2_long  = m2_ok and (m2_bias >= 0 or i_relax) and surge_m2 >= i_m2_surge and bull_bar and close > sess_vwap and pass_long  and score_m2l >= i_min_conf
+m2_short = m2_ok and (m2_bias <  0 or i_relax) and surge_m2 >= i_m2_surge and bear_bar and close < sess_vwap and pass_short and score_m2s >= i_min_conf
+
+// ── Webhook payload (compatible with cos_webhook_handler.py, enriched) ────────
+f_alert(string act, string modn, float tp, float sl, float srg, int qty, int score) =>
+    str.format('{{"symbol":"MNQ","action":"{0}","strategy":"COS","module":"{1}","entry":{2},"qty":{3},"tp":{4},"sl":{5},"surge":{6},"vwap":{7},"confluence_score":{8},"isAutomated":true}}', act, modn, math.round(close, 2), qty, math.round(tp, 2), math.round(sl, 2), math.round(srg, 2), math.round(sess_vwap, 2), score)
+
+// ── Draw helper ──────────────────────────────────────────────────────────────
+f_draw(float tp, float sl, bool dashed) =>
+    if i_show_lines
+        ls = dashed ? line.style_dashed : line.style_solid
+        line.new(bar_index, tp, bar_index + 25, tp, color=color.new(color.lime, 25), width=1, style=ls)
+        line.new(bar_index, sl, bar_index + 25, sl, color=color.new(color.red,  25), width=1, style=ls)
+
+// ── Execute M1 ───────────────────────────────────────────────────────────────
+if m1_long
+    pos_entry := close
+    pos_dir   := 1
+    pos_tp    := close + m1_tp_pts
+    pos_sl    := close - m1_sl_pts
+    m1_trades += 1
+    alert(f_alert("BUY", "COS-PRO", pos_tp, pos_sl, surge_m1, m1_qty, score_m1l), alert.freq_once_per_bar_close)
+    f_draw(pos_tp, pos_sl, false)
+    label.new(bar_index, low - m1_sl_pts * 0.5, "BUY " + str.tostring(m1_qty) + "c\n" + str.tostring(score_m1l) + "%", color=color.new(color.lime, 10), textcolor=color.white, size=size.small, style=label.style_label_up)
+if m1_short
+    pos_entry := close
+    pos_dir   := -1
+    pos_tp    := close - m1_tp_pts
+    pos_sl    := close + m1_sl_pts
+    m1_trades += 1
+    alert(f_alert("SELL", "COS-PRO", pos_tp, pos_sl, surge_m1, m1_qty, score_m1s), alert.freq_once_per_bar_close)
+    f_draw(pos_tp, pos_sl, false)
+    label.new(bar_index, high + m1_sl_pts * 0.5, "SELL " + str.tostring(m1_qty) + "c\n" + str.tostring(score_m1s) + "%", color=color.new(color.red, 10), textcolor=color.white, size=size.small, style=label.style_label_down)
+
+// ── Execute M2 ───────────────────────────────────────────────────────────────
+if m2_long
+    pos_entry := close
+    pos_dir   := 1
+    pos_tp    := close + m2_tp_pts
+    pos_sl    := close - m2_sl_pts
+    m2_trades += 1
+    alert(f_alert("BUY", "PM-SCALP", pos_tp, pos_sl, surge_m2, 1, score_m2l), alert.freq_once_per_bar_close)
+    f_draw(pos_tp, pos_sl, true)
+    label.new(bar_index, low - m2_sl_pts * 0.5, "M2 BUY\n" + str.tostring(score_m2l) + "%", color=color.new(color.aqua, 20), textcolor=color.white, size=size.tiny, style=label.style_label_up)
+if m2_short
+    pos_entry := close
+    pos_dir   := -1
+    pos_tp    := close - m2_tp_pts
+    pos_sl    := close + m2_sl_pts
+    m2_trades += 1
+    alert(f_alert("SELL", "PM-SCALP", pos_tp, pos_sl, surge_m2, 1, score_m2s), alert.freq_once_per_bar_close)
+    f_draw(pos_tp, pos_sl, true)
+    label.new(bar_index, high + m2_sl_pts * 0.5, "M2 SELL\n" + str.tostring(score_m2s) + "%", color=color.new(color.fuchsia, 20), textcolor=color.white, size=size.tiny, style=label.style_label_down)
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+plot(sess_vwap, "Session VWAP", color=color.new(color.yellow, 0), linewidth=2)
+plot(i_use_ema ? ema_val : na, "EMA Trend", color=color.new(color.orange, 0), linewidth=1)
+bgcolor(m1_window and m1_ok ? color.new(color.lime, 95) : na, title="M1 Window")
+bgcolor(m2_window and m2_ok ? color.new(color.blue, 97) : na, title="M2 Window")
+bgcolor(not i_relax and regime_high ? color.new(color.red,  93) : na, title="HIGH ATR")
+bgcolor(not i_relax and is_tuesday  ? color.new(color.gray, 93) : na, title="Tue Skip")
+barcolor(surge_m1 >= i_m1_surge and m1_window ? color.new(color.blue, 40) : na, title="M1 Surge")
+barcolor(surge_m2 >= i_m2_surge and m2_window ? color.new(color.teal, 50) : na, title="M2 Surge")
+plotshape(m1_long,  "M1 BUY",  shape.triangleup,   location.belowbar, color.lime,    size=size.large)
+plotshape(m1_short, "M1 SELL", shape.triangledown, location.abovebar, color.red,     size=size.large)
+plotshape(m2_long,  "M2 BUY",  shape.triangleup,   location.belowbar, color.aqua,    size=size.normal)
+plotshape(m2_short, "M2 SELL", shape.triangledown, location.abovebar, color.fuchsia, size=size.normal)
+
+// ── Alert conditions (for fixed-message alerts if preferred) ──────────────────
+alertcondition(m1_long or m2_long,   "COS LONG",  "COS long signal")
+alertcondition(m1_short or m2_short, "COS SHORT", "COS short signal")
+
+// ── Dashboard ────────────────────────────────────────────────────────────────
+bias_long  = close > sess_vwap
+score_disp = bias_long ? score_m1l : score_m1s
+var table t = table.new(position.top_right, 2, 17, bgcolor=color.new(color.black, 60), border_width=1)
+if barstate.islast
+    table.cell(t, 0, 0,  "COS-FULL",      text_color=color.white,  text_size=size.normal)
+    table.cell(t, 1, 0,  "MNQ 1min",      text_color=color.yellow, text_size=size.normal)
+    table.cell(t, 0, 1,  "State",         text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 1,  flat ? "FLAT ✓" : (pos_dir == 1 ? "LONG @ " : "SHORT @ ") + str.tostring(math.round(pos_entry, 2)), text_color=flat ? color.lime : color.aqua, text_size=size.tiny)
+    table.cell(t, 0, 2,  "Today W/L",     text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 2,  str.tostring(wins) + "W / " + str.tostring(losses) + "L", text_color=wins >= losses ? color.lime : color.red, text_size=size.tiny)
+    table.cell(t, 0, 3,  "Conf Score",    text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 3,  str.tostring(score_disp) + "%" + (bias_long ? " ▲" : " ▼"), text_color=score_disp >= 70 ? color.lime : score_disp >= 50 ? color.yellow : color.gray, text_size=size.tiny)
+    table.cell(t, 0, 4,  "EMA Trend",     text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 4,  not i_use_ema ? "OFF" : (trend_up ? "UP ▲" : "DOWN ▼"), text_color=not i_use_ema ? color.gray : trend_up ? color.lime : color.red, text_size=size.tiny)
+    table.cell(t, 0, 5,  "RSI(" + str.tostring(i_rsi_len) + ")", text_color=color.gray, text_size=size.tiny)
+    table.cell(t, 1, 5,  str.tostring(math.round(rsi_val, 1)), text_color=rsi_val >= i_rsi_ob or rsi_val <= i_rsi_os ? color.red : color.white, text_size=size.tiny)
+    table.cell(t, 0, 6,  "Delta",         text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 6,  cum_delta >= 0 ? "BULL +" : "BEAR -", text_color=cum_delta >= 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(t, 0, 7,  "ATR Regime",    text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 7,  regime_high ? "HIGH ⛔" : regime_low ? "LOW" : "NORMAL ✓", text_color=regime_high ? color.red : color.lime, text_size=size.tiny)
+    table.cell(t, 0, 8,  "M1 Window",     text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 8,  "9:30-11 ET",    text_color=m1_window ? color.lime : color.gray, text_size=size.tiny)
+    table.cell(t, 0, 9,  "M1 Surge",      text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 9,  str.tostring(i_m1_surge) + "x | " + str.tostring(math.round(surge_m1, 1)) + "x", text_color=surge_m1 >= i_m1_surge ? color.lime : color.gray, text_size=size.tiny)
+    table.cell(t, 0, 10, "M1 Trades",     text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 10, str.tostring(m1_trades) + "/2", text_color=m1_trades >= 2 ? color.red : color.lime, text_size=size.tiny)
+    table.cell(t, 0, 11, "M1 Size",       text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 11, str.tostring(m1_qty) + "c", text_color=m1_qty >= 2 ? color.yellow : color.white, text_size=size.tiny)
+    table.cell(t, 0, 12, "M2 Window",     text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 12, "11-2 ET",       text_color=m2_window ? color.aqua : color.gray, text_size=size.tiny)
+    table.cell(t, 0, 13, "M2 Bias",       text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 13, m2_bias >= 0 ? "BULL" : "BEAR", text_color=m2_bias >= 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(t, 0, 14, "M2 Trades",     text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 14, str.tostring(m2_trades) + "/" + str.tostring(i_m2_max), text_color=m2_trades >= i_m2_max ? color.red : color.aqua, text_size=size.tiny)
+    table.cell(t, 0, 15, "TP/SL",         text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 15, str.tostring(math.round(m1_tp_pts, 1)) + "/" + str.tostring(math.round(m1_sl_pts, 1)) + (i_use_adapt ? " ATR" : " pts"), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 16, "Mode",          text_color=color.gray,   text_size=size.tiny)
+    table.cell(t, 1, 16, (i_relax ? "RELAX" : "STRICT") + (i_min_conf > 0 ? " · ≥" + str.tostring(i_min_conf) + "%" : ""), text_color=i_relax ? color.yellow : color.white, text_size=size.tiny)
